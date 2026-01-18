@@ -3,3 +3,6 @@ numpy
 matplotlib
 scikit-learn
 openpyxl
+fastapi
+uvicorn
+pydantic
