@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import pickle
 import requests
+import os
 
 app = FastAPI()
 
@@ -19,32 +20,27 @@ app.add_middleware(
 )
 
 # ── Configuration ──────────────────────────────────────────────
-ENROLLMENT_API_URL = "http://localhost:3000/api/enrollment-forecast"
+ENROLLMENT_API_URL = os.environ.get("ENROLLMENT_API_URL", "http://localhost:3000/api/enrollment-forecast")
+
+# ── Pydantic Models ───────────────────────────────────────────
+class StudentRecord(BaseModel):
+    course: str
+    total_students: int
+    year: int
+
+class PredictionRequest(BaseModel):
+    data: List[StudentRecord]
 
 class PredictionResult(BaseModel):
     course: str
     predicted_year: int
     predicted_count: int
 
-@app.get("/predict", response_model=List[PredictionResult])
-def predict_student_counts(target_year: Optional[int] = Query(None, description="Year to predict for (defaults to next year)")):
-    """
-    Fetches live enrollment data from the database, trains a model per course,
-    and returns next-year predictions.
-    """
-    # Fetch data from enrollment system
-    response = requests.get(ENROLLMENT_API_URL, timeout=10)
-    response.raise_for_status()
-    records = response.json()
 
-    if not records:
-        return []
-
-    df = pd.DataFrame(records)
-    df.columns = ["Course", "Year", "Total_Students"]
+def _run_prediction(df: pd.DataFrame, target_year: Optional[int] = None) -> List[PredictionResult]:
+    """Shared logic: train a linear regression per course and return predictions."""
     data = df.sort_values(by=["Course", "Year"])
     courses = data["Course"].unique()
-
     predictions = []
 
     for course in courses:
@@ -71,8 +67,41 @@ def predict_student_counts(target_year: Optional[int] = Query(None, description=
 
     return predictions
 
+
+# ── POST /predict — accepts data from the enrollment app directly ──
+@app.post("/predict", response_model=List[PredictionResult])
+def predict_from_post(request: PredictionRequest, target_year: Optional[int] = Query(None)):
+    """
+    Accepts enrollment data via POST body and returns predictions.
+    This is what the enrollment system calls.
+    """
+    records = [{"Course": r.course, "Total_Students": r.total_students, "Year": r.year} for r in request.data]
+    if not records:
+        return []
+    df = pd.DataFrame(records)
+    return _run_prediction(df, target_year)
+
+
+# ── GET /predict — fetches data from the enrollment API ────────────
+@app.get("/predict", response_model=List[PredictionResult])
+def predict_from_get(target_year: Optional[int] = Query(None)):
+    """
+    Fetches live enrollment data from the enrollment-forecast API,
+    trains a model per course, and returns predictions.
+    """
+    response = requests.get(ENROLLMENT_API_URL, timeout=10)
+    response.raise_for_status()
+    records = response.json()
+    if not records:
+        return []
+    df = pd.DataFrame(records)
+    df.columns = ["Course", "Year", "Total_Students"]
+    return _run_prediction(df, target_year)
+
+
+# ── GET /predict/pickle — uses pre-trained models ──────────────
 @app.get("/predict/pickle", response_model=List[PredictionResult])
-def predict_from_pickle(target_year: Optional[int] = Query(None, description="Year to predict for")):
+def predict_from_pickle(target_year: Optional[int] = Query(None)):
     """
     Uses pre-trained models from models.pkl for predictions.
     Run create_model.py first to generate the pickle file.
