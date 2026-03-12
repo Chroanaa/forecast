@@ -7,7 +7,7 @@ import sys
 
 # ── Configuration ──────────────────────────────────────────────
 # Point this to your running enrollment system
-API_URL = "http://localhost:3000/api/enrollment-forecast"
+API_URL = "http://localhost:3000/api/enrollment-forecast" | "https://enroll-livid.vercel.app/api/enrollment-forecast" 
 
 # ── Fetch data from the enrollment database via API ───────────
 print("Fetching enrollment data from database...")
