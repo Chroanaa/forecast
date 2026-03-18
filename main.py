@@ -86,6 +86,7 @@ class SectionRoomRecommendation(BaseModel):
     available_room_slots: int      # sum of capacities of "available" rooms
     rooms_to_add: int              # extra rooms required if pool is short
     add_room: bool
+    status: str                    # legacy-compatible summary text
     recommendation: str            # human-readable advice
 
 
@@ -228,7 +229,9 @@ def _run_capacity_prediction(
                 f"consider adding {rooms_to_add} room(s)."
             )
         else:
-            lines.append("Available room pool is adequate for this program.")
+            lines.append("No additional room needed; available room pool is adequate for this program.")
+
+        recommendation_text = " ".join(lines)
 
         results.append(SectionRoomRecommendation(
             program=program,
@@ -248,7 +251,8 @@ def _run_capacity_prediction(
             available_room_slots=total_room_capacity,
             rooms_to_add=rooms_to_add,
             add_room=add_room,
-            recommendation=" ".join(lines),
+            status=recommendation_text,
+            recommendation=recommendation_text,
         ))
 
     return results
