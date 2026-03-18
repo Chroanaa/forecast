@@ -165,7 +165,7 @@ def _run_capacity_prediction(
 
         current_sections = int(pdata["section_count"].iloc[-1])
         sections_to_add = max(0, sections_needed - current_sections)
-        total_capacity_needed = predicted_students
+        total_capacity_needed = sections_needed * avg_cap
 
         # Room allocation from shared pool
         remaining_room_capacity = total_room_capacity - allocated_capacity
