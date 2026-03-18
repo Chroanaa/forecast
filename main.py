@@ -8,7 +8,7 @@ from typing import List, Optional
 import math
 import requests
 import os
-
+import pickle 
 app = FastAPI()
 
 # Allow requests from the enrollment frontend
@@ -74,11 +74,18 @@ class SectionRoomRecommendation(BaseModel):
     current_sections: int          # latest known section count
     sections_needed: int           # model prediction
     sections_to_add: int           # max(0, needed - current)
+    add_section: bool
+    additional_sections_needed: int
+    recommended_sections: int
     avg_section_capacity: int
+    current_capacity: int
+    new_total_capacity: int
+    utilization_rate: int
     # Room analysis (shared pool)
     total_capacity_needed: int     # sections_needed * avg_section_capacity
     available_room_slots: int      # sum of capacities of "available" rooms
     rooms_to_add: int              # extra rooms required if pool is short
+    add_room: bool
     recommendation: str            # human-readable advice
 
 
@@ -158,20 +165,40 @@ def _run_capacity_prediction(
         else:
             predicted_students = int(y_students[-1])
 
-        # -- Sections needed: capacity-based calculation
-        # Use ceiling division so we only recommend new sections when
-        # predicted students actually exceed what current sections can hold.
-        sections_needed = max(1, math.ceil(predicted_students / max(avg_cap, 1)))
+        # -- Model B: sections needed = f(student_count)
+        if len(y_students) >= 2:
+            X_students = pdata[["student_count"]].values
+            capacity_model = linear_model.LinearRegression()
+            capacity_model.fit(X_students, y_sections)
+            sections_needed = max(1, int(math.ceil(
+                capacity_model.predict([[predicted_students]])[0]
+            )))
+        else:
+            # Fallback: simple ceiling division
+            sections_needed = max(1, math.ceil(predicted_students / max(avg_cap, 1)))
 
         current_sections = int(pdata["section_count"].iloc[-1])
         sections_to_add = max(0, sections_needed - current_sections)
+        add_section = sections_to_add > 0
+        additional_sections_needed = sections_to_add
+        recommended_sections = sections_needed
+        current_capacity = current_sections * avg_cap
         total_capacity_needed = sections_needed * avg_cap
+        new_total_capacity = total_capacity_needed
+
+        # Utilization should be based on current total capacity, not projected/recommended capacity.
+        utilization_rate = (
+            int(round((predicted_students / current_capacity) * 100))
+            if current_capacity > 0
+            else 0
+        )
 
         # Room allocation from shared pool
         remaining_room_capacity = total_room_capacity - allocated_capacity
-        shortfall = predicted_students - remaining_room_capacity
+        shortfall = total_capacity_needed - remaining_room_capacity
         rooms_to_add = max(0, math.ceil(shortfall / max(avg_cap, 1))) if shortfall > 0 else 0
-        allocated_capacity += predicted_students
+        add_room = rooms_to_add > 0
+        allocated_capacity += total_capacity_needed
 
         # Build recommendation text
         lines = []
@@ -187,8 +214,8 @@ def _run_capacity_prediction(
             )
         if rooms_to_add > 0:
             lines.append(
-                f"Room capacity short by ~{max(0, shortfall)} seat(s) — "
-                f"recommend adding {rooms_to_add} room(s) (capacity ~{avg_cap} each)."
+                f"Room capacity may be short by ~{max(0,shortfall)} seats — "
+                f"consider adding {rooms_to_add} room(s)."
             )
         else:
             lines.append("Available room pool is adequate for this program.")
@@ -200,10 +227,17 @@ def _run_capacity_prediction(
             current_sections=current_sections,
             sections_needed=sections_needed,
             sections_to_add=sections_to_add,
+            add_section=add_section,
+            additional_sections_needed=additional_sections_needed,
+            recommended_sections=recommended_sections,
             avg_section_capacity=avg_cap,
+            current_capacity=current_capacity,
+            new_total_capacity=new_total_capacity,
+            utilization_rate=utilization_rate,
             total_capacity_needed=total_capacity_needed,
             available_room_slots=total_room_capacity,
             rooms_to_add=rooms_to_add,
+            add_room=add_room,
             recommendation=" ".join(lines),
         ))
 
