@@ -158,27 +158,20 @@ def _run_capacity_prediction(
         else:
             predicted_students = int(y_students[-1])
 
-        # -- Model B: sections needed = f(student_count)
-        if len(y_students) >= 2:
-            X_students = pdata[["student_count"]].values
-            capacity_model = linear_model.LinearRegression()
-            capacity_model.fit(X_students, y_sections)
-            sections_needed = max(1, int(math.ceil(
-                capacity_model.predict([[predicted_students]])[0]
-            )))
-        else:
-            # Fallback: simple ceiling division
-            sections_needed = max(1, math.ceil(predicted_students / max(avg_cap, 1)))
+        # -- Sections needed: capacity-based calculation
+        # Use ceiling division so we only recommend new sections when
+        # predicted students actually exceed what current sections can hold.
+        sections_needed = max(1, math.ceil(predicted_students / max(avg_cap, 1)))
 
         current_sections = int(pdata["section_count"].iloc[-1])
         sections_to_add = max(0, sections_needed - current_sections)
-        total_capacity_needed = sections_needed * avg_cap
+        total_capacity_needed = predicted_students
 
         # Room allocation from shared pool
         remaining_room_capacity = total_room_capacity - allocated_capacity
-        shortfall = total_capacity_needed - remaining_room_capacity
+        shortfall = predicted_students - remaining_room_capacity
         rooms_to_add = max(0, math.ceil(shortfall / max(avg_cap, 1))) if shortfall > 0 else 0
-        allocated_capacity += total_capacity_needed
+        allocated_capacity += predicted_students
 
         # Build recommendation text
         lines = []
@@ -194,8 +187,8 @@ def _run_capacity_prediction(
             )
         if rooms_to_add > 0:
             lines.append(
-                f"Room capacity may be short by ~{max(0,shortfall)} seats — "
-                f"consider adding {rooms_to_add} room(s)."
+                f"Room capacity short by ~{max(0, shortfall)} seat(s) — "
+                f"recommend adding {rooms_to_add} room(s) (capacity ~{avg_cap} each)."
             )
         else:
             lines.append("Available room pool is adequate for this program.")
