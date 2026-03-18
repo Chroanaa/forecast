@@ -166,16 +166,26 @@ def _run_capacity_prediction(
             predicted_students = int(y_students[-1])
 
         # -- Model B: sections needed = f(student_count)
-        if len(y_students) >= 2:
+        min_sections_by_capacity = (
+            int(math.ceil(predicted_students / max(avg_cap, 1)))
+            if predicted_students > 0
+            else 0
+        )
+
+        # Tiny cohorts should not trigger extra sections from regression noise.
+        if predicted_students <= avg_cap:
+            sections_needed = min_sections_by_capacity
+        elif len(y_students) >= 2:
             X_students = pdata[["student_count"]].values
             capacity_model = linear_model.LinearRegression()
             capacity_model.fit(X_students, y_sections)
-            sections_needed = max(1, int(math.ceil(
+            model_sections = max(0, int(math.ceil(
                 capacity_model.predict([[predicted_students]])[0]
             )))
+            sections_needed = max(min_sections_by_capacity, model_sections)
         else:
             # Fallback: simple ceiling division
-            sections_needed = max(1, math.ceil(predicted_students / max(avg_cap, 1)))
+            sections_needed = min_sections_by_capacity
 
         current_sections = int(pdata["section_count"].iloc[-1])
         sections_to_add = max(0, sections_needed - current_sections)
