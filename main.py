@@ -1,14 +1,16 @@
+import math
+import os
+import pickle
+import re
+from typing import List, Optional
+
 import pandas as pd
-import numpy as np
-from sklearn import linear_model
+import requests
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
-import math
-import requests
-import os
-import pickle 
+from sklearn import linear_model
+
 app = FastAPI()
 
 # Allow requests from the enrollment frontend
@@ -19,61 +21,77 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Configuration ──────────────────────────────────────────────
-ENROLLMENT_API_URL = os.environ.get("ENROLLMENT_API_URL", "http://localhost:3000/api/auth/student/forecast")
+# Configuration
+ENROLLMENT_API_URL = os.environ.get(
+    "ENROLLMENT_API_URL",
+    "http://localhost:3000/api/auth/student/forecast",
+)
 
-# ── Pydantic Models — Enrollment ──────────────────────────────
+
+# Pydantic Models - Enrollment
 class StudentRecord(BaseModel):
     course: str
     total_students: int
-    year: int
+    school_year: Optional[str] = None
+    year: Optional[int] = None
+
 
 class PredictionResult(BaseModel):
     course: str
+    predicted_school_year: str
     predicted_year: int
     predicted_count: int
 
 
-# ── Pydantic Models — Capacity ────────────────────────────────
+# Pydantic Models - Capacity
 class SectionHistoryRecord(BaseModel):
-    """One row: how many sections existed for a program in a given year."""
+    """One row: how many sections existed for a program in a given school year."""
+
     program: str
-    year: int
-    student_count: int       # total enrolled that year
-    section_count: int       # how many sections existed
-    avg_section_capacity: int  # max_capacity of a typical section
+    school_year: Optional[str] = None
+    year: Optional[int] = None
+    student_count: int
+    section_count: int
+    avg_section_capacity: int
+
 
 class RoomRecord(BaseModel):
     room_id: int
     capacity: int
-    room_type: str           # e.g. "lecture", "lab"
-    status: str              # "available" | "occupied" | "maintenance"
+    room_type: str
+    status: str
+
 
 class PredictionRequest(BaseModel):
     data: List[StudentRecord]
     section_history: Optional[List[SectionHistoryRecord]] = None
     rooms: Optional[List[RoomRecord]] = None
     target_year: Optional[int] = None
+    target_school_year: Optional[str] = None
+
 
 class CapacityRequest(BaseModel):
     """
     POST body for /predict/capacity.
-    - section_history: historical rows (year, program, student_count, section_count, avg_section_capacity)
+    - section_history: historical rows (school_year/year, program, student_count, section_count, avg_section_capacity)
     - rooms: current room inventory from the DB
-    - target_year: optional override for the prediction year
+    - target_year: optional override for the prediction school year's start year
     """
+
     section_history: List[SectionHistoryRecord]
     rooms: List[RoomRecord]
     target_year: Optional[int] = None
+    target_school_year: Optional[str] = None
+
 
 class SectionRoomRecommendation(BaseModel):
     program: str
+    predicted_school_year: str
     predicted_year: int
     predicted_students: int
-    # Section predictions
-    current_sections: int          # latest known section count
-    sections_needed: int           # model prediction
-    sections_to_add: int           # max(0, needed - current)
+    current_sections: int
+    sections_needed: int
+    sections_to_add: int
     add_section: bool
     additional_sections_needed: int
     recommended_sections: int
@@ -81,42 +99,139 @@ class SectionRoomRecommendation(BaseModel):
     current_capacity: int
     new_total_capacity: int
     utilization_rate: int
-    # Room analysis (shared pool)
-    total_capacity_needed: int     # sections_needed * avg_section_capacity
-    available_room_slots: int      # sum of capacities of "available" rooms
-    rooms_to_add: int              # extra rooms required if pool is short
+    total_capacity_needed: int
+    available_room_slots: int
+    rooms_to_add: int
     add_room: bool
-    status: str                    # legacy-compatible summary text
-    recommendation: str            # human-readable advice
+    status: str
+    recommendation: str
 
 
-# ── Shared helpers ─────────────────────────────────────────────
-def _run_prediction(df: pd.DataFrame, target_year: Optional[int] = None) -> List[PredictionResult]:
-    """Train a linear regression per course and return enrollment predictions."""
-    data = df.sort_values(by=["Course", "Year"])
+# Shared helpers
+def _first_present(record: dict, *keys: str):
+    for key in keys:
+        if key in record and record[key] is not None:
+            return record[key]
+    return None
+
+
+def _school_year_label(start_year: int) -> str:
+    return f"{start_year}-{start_year + 1}"
+
+
+def _parse_school_year_value(
+    school_year: Optional[str] = None,
+    year: Optional[int] = None,
+) -> int:
+    if school_year:
+        match = re.search(r"(?:19|20)\d{2}", str(school_year))
+        if match:
+            return int(match.group(0))
+        raise ValueError(f"Invalid school_year format: {school_year}")
+
+    if year is not None:
+        return int(year)
+
+    raise ValueError("A school_year or year value is required.")
+
+
+def _resolve_target_school_year(
+    target_year: Optional[int],
+    target_school_year: Optional[str],
+    default_start_year: int,
+) -> int:
+    if target_school_year:
+        return _parse_school_year_value(target_school_year, None)
+    if target_year is not None:
+        return int(target_year)
+    return default_start_year + 1
+
+
+def _normalize_enrollment_dataframe(records: List[dict]) -> pd.DataFrame:
+    normalized = []
+
+    for record in records:
+        course = _first_present(record, "Course", "course")
+        total_students = _first_present(record, "Total_Students", "total_students")
+        school_year = _first_present(record, "School_Year", "school_year")
+        year = _first_present(record, "Year", "year")
+
+        if course is None or total_students is None:
+            raise ValueError("Each enrollment record must include course and total_students.")
+
+        school_year_value = _parse_school_year_value(school_year, year)
+        normalized.append(
+            {
+                "Course": course,
+                "School_Year": school_year or _school_year_label(school_year_value),
+                "School_Year_Value": school_year_value,
+                "Total_Students": int(total_students),
+            }
+        )
+
+    return pd.DataFrame(normalized)
+
+
+def _normalize_section_history_dataframe(
+    section_history: List[SectionHistoryRecord],
+) -> pd.DataFrame:
+    normalized = []
+
+    for record in section_history:
+        item = record.dict() if hasattr(record, "dict") else dict(record)
+        school_year = _first_present(item, "school_year", "School_Year")
+        year = _first_present(item, "year", "Year")
+        school_year_value = _parse_school_year_value(school_year, year)
+
+        normalized.append(
+            {
+                **item,
+                "school_year": school_year or _school_year_label(school_year_value),
+                "school_year_value": school_year_value,
+            }
+        )
+
+    return pd.DataFrame(normalized)
+
+
+def _run_prediction(
+    df: pd.DataFrame,
+    target_year: Optional[int] = None,
+    target_school_year: Optional[str] = None,
+) -> List[PredictionResult]:
+    """Train a linear regression per course and return enrollment predictions by school year."""
+
+    data = df.sort_values(by=["Course", "School_Year_Value"])
     courses = data["Course"].unique()
     predictions = []
 
     for course in courses:
         course_data = data[data["Course"] == course]
-        X = course_data[["Year"]].values
+        X = course_data[["School_Year_Value"]].values
         y = course_data["Total_Students"].values
 
         if len(X) < 2:
             continue
 
-        last_year = int(course_data["Year"].max())
-        predict_year = target_year if target_year else last_year + 1
+        last_year = int(course_data["School_Year_Value"].max())
+        predict_year = _resolve_target_school_year(
+            target_year,
+            target_school_year,
+            last_year,
+        )
 
         model = linear_model.LinearRegression()
         model.fit(X, y)
 
         predicted_count = model.predict([[predict_year]])[0]
-        predictions.append(PredictionResult(
-            course=course,
-            predicted_year=predict_year,
-            predicted_count=max(0, int(round(predicted_count)))
-        ))
+        predictions.append(
+            PredictionResult(
+                course=course,
+                predicted_school_year=_school_year_label(predict_year),
+                predicted_year=predict_year,
+                predicted_count=max(0, int(round(predicted_count))),
+            )
+        )
 
     return predictions
 
@@ -125,67 +240,71 @@ def _run_capacity_prediction(
     section_history: List[SectionHistoryRecord],
     rooms: List[RoomRecord],
     target_year: Optional[int],
+    target_school_year: Optional[str],
 ) -> List[SectionRoomRecommendation]:
     """
     For each program:
       1. Train LinearRegression: sections_needed = f(student_count)
-      2. Predict enrollment for target_year (also via LinearRegression on students)
+      2. Predict enrollment for the target school year
       3. Predict sections needed for that enrollment
       4. Compare vs available room pool and surface recommendations
     """
+
     if not section_history:
         return []
 
-    df = pd.DataFrame([r.dict() for r in section_history])
+    df = _normalize_section_history_dataframe(section_history)
     programs = df["program"].unique()
 
-    # Total available room capacity (ignore occupied / maintenance)
     available_rooms = [r for r in rooms if r.status.lower() == "available"]
     total_room_capacity = sum(r.capacity for r in available_rooms)
-    # Track how much room capacity has been "allocated" as we iterate programs
     allocated_capacity = 0
 
     results = []
 
     for program in programs:
-        pdata = df[df["program"] == program].sort_values("year")
+        pdata = df[df["program"] == program].sort_values("school_year_value")
 
-        X_years = pdata[["year"]].values
+        X_years = pdata[["school_year_value"]].values
         y_students = pdata["student_count"].values
         y_sections = pdata["section_count"].values
         avg_cap = int(pdata["avg_section_capacity"].median())
 
-        last_year = int(pdata["year"].max())
-        predict_year = target_year if target_year else last_year + 1
+        last_year = int(pdata["school_year_value"].max())
+        predict_year = _resolve_target_school_year(
+            target_year,
+            target_school_year,
+            last_year,
+        )
 
-        # -- Model A: predict enrollment for target year
         if len(X_years) >= 2:
             enroll_model = linear_model.LinearRegression()
             enroll_model.fit(X_years, y_students)
-            predicted_students = max(0, int(round(enroll_model.predict([[predict_year]])[0])))
+            predicted_students = max(
+                0,
+                int(round(enroll_model.predict([[predict_year]])[0])),
+            )
         else:
             predicted_students = int(y_students[-1])
 
-        # -- Model B: sections needed = f(student_count)
         min_sections_by_capacity = (
             int(math.ceil(predicted_students / max(avg_cap, 1)))
             if predicted_students > 0
             else 0
         )
 
-        # Tiny cohorts should not trigger extra sections from regression noise.
         if predicted_students <= avg_cap:
             sections_needed = min_sections_by_capacity
         elif len(y_students) >= 2:
             X_students = pdata[["student_count"]].values
             capacity_model = linear_model.LinearRegression()
             capacity_model.fit(X_students, y_sections)
-            model_sections = max(0, int(math.ceil(
-                capacity_model.predict([[predicted_students]])[0]
-            )))
+            model_sections = max(
+                0,
+                int(math.ceil(capacity_model.predict([[predicted_students]])[0])),
+            )
             sections_needed = max(min_sections_by_capacity, model_sections)
         else:
-            # Fallback: simple ceiling division
             sections_needed = min_sections_by_capacity
 
         current_sections = int(pdata["section_count"].iloc[-1])
@@ -197,25 +316,26 @@ def _run_capacity_prediction(
         total_capacity_needed = sections_needed * avg_cap
         new_total_capacity = total_capacity_needed
 
-        # Utilization should be based on current total capacity, not projected/recommended capacity.
         utilization_rate = (
             int(round((predicted_students / current_capacity) * 100))
             if current_capacity > 0
             else 0
         )
 
-        # Room allocation from shared pool
         remaining_room_capacity = total_room_capacity - allocated_capacity
         shortfall = total_capacity_needed - remaining_room_capacity
-        rooms_to_add = max(0, math.ceil(shortfall / max(avg_cap, 1))) if shortfall > 0 else 0
+        rooms_to_add = (
+            max(0, math.ceil(shortfall / max(avg_cap, 1)))
+            if shortfall > 0
+            else 0
+        )
         add_room = rooms_to_add > 0
         allocated_capacity += total_capacity_needed
 
-        # Build recommendation text
         lines = []
         if sections_to_add > 0:
             lines.append(
-                f"Add {sections_to_add} section(s) — projected {predicted_students} students "
+                f"Add {sections_to_add} section(s) - projected {predicted_students} students "
                 f"needs {sections_needed} sections (currently {current_sections})."
             )
         else:
@@ -225,40 +345,44 @@ def _run_capacity_prediction(
             )
         if rooms_to_add > 0:
             lines.append(
-                f"Room capacity may be short by ~{max(0,shortfall)} seats — "
+                f"Room capacity may be short by ~{max(0, shortfall)} seats - "
                 f"consider adding {rooms_to_add} room(s)."
             )
         else:
-            lines.append("No additional room needed; available room pool is adequate for this program.")
+            lines.append(
+                "No additional room needed; available room pool is adequate for this program."
+            )
 
         recommendation_text = " ".join(lines)
 
-        results.append(SectionRoomRecommendation(
-            program=program,
-            predicted_year=predict_year,
-            predicted_students=predicted_students,
-            current_sections=current_sections,
-            sections_needed=sections_needed,
-            sections_to_add=sections_to_add,
-            add_section=add_section,
-            additional_sections_needed=additional_sections_needed,
-            recommended_sections=recommended_sections,
-            avg_section_capacity=avg_cap,
-            current_capacity=current_capacity,
-            new_total_capacity=new_total_capacity,
-            utilization_rate=utilization_rate,
-            total_capacity_needed=total_capacity_needed,
-            available_room_slots=total_room_capacity,
-            rooms_to_add=rooms_to_add,
-            add_room=add_room,
-            status=recommendation_text,
-            recommendation=recommendation_text,
-        ))
+        results.append(
+            SectionRoomRecommendation(
+                program=program,
+                predicted_school_year=_school_year_label(predict_year),
+                predicted_year=predict_year,
+                predicted_students=predicted_students,
+                current_sections=current_sections,
+                sections_needed=sections_needed,
+                sections_to_add=sections_to_add,
+                add_section=add_section,
+                additional_sections_needed=additional_sections_needed,
+                recommended_sections=recommended_sections,
+                avg_section_capacity=avg_cap,
+                current_capacity=current_capacity,
+                new_total_capacity=new_total_capacity,
+                utilization_rate=utilization_rate,
+                total_capacity_needed=total_capacity_needed,
+                available_room_slots=total_room_capacity,
+                rooms_to_add=rooms_to_add,
+                add_room=add_room,
+                status=recommendation_text,
+                recommendation=recommendation_text,
+            )
+        )
 
     return results
 
 
-# ── POST /predict — enrollment + capacity predictions ────────
 @app.post("/predict")
 def predict_from_post(request: PredictionRequest):
     """
@@ -266,12 +390,17 @@ def predict_from_post(request: PredictionRequest):
     Always returns enrollment_predictions.
     If section_history and rooms are provided, also returns capacity_recommendations.
     """
-    records = [{"Course": r.course, "Total_Students": r.total_students, "Year": r.year} for r in request.data]
+
+    records = [r.dict() for r in request.data]
     if not records:
         return {"enrollment_predictions": [], "capacity_recommendations": []}
 
-    df = pd.DataFrame(records)
-    enrollment_predictions = _run_prediction(df, request.target_year)
+    df = _normalize_enrollment_dataframe(records)
+    enrollment_predictions = _run_prediction(
+        df,
+        request.target_year,
+        request.target_school_year,
+    )
 
     capacity_recommendations = []
     if request.section_history and request.rooms:
@@ -279,6 +408,7 @@ def predict_from_post(request: PredictionRequest):
             request.section_history,
             request.rooms,
             request.target_year,
+            request.target_school_year,
         )
 
     return {
@@ -287,29 +417,34 @@ def predict_from_post(request: PredictionRequest):
     }
 
 
-# ── GET /predict — enrollment predictions (live data) ────────
 @app.get("/predict", response_model=List[PredictionResult])
-def predict_from_get(target_year: Optional[int] = Query(None)):
-    """Fetches live enrollment data from the enrollment API and returns predictions."""
+def predict_from_get(
+    target_year: Optional[int] = Query(None),
+    target_school_year: Optional[str] = Query(None),
+):
+    """Fetches live enrollment data and returns predictions by school year."""
+
     response = requests.get(ENROLLMENT_API_URL, timeout=10)
     response.raise_for_status()
     payload = response.json()
-    # Handle both old flat-array format and new object format { enrollment: [...], ... }
     records = payload.get("enrollment", payload) if isinstance(payload, dict) else payload
     if not records:
         return []
-    df = pd.DataFrame(records)
-    df = df.rename(columns={"course": "Course", "year": "Year", "total_students": "Total_Students"})
-    return _run_prediction(df, target_year)
+
+    df = _normalize_enrollment_dataframe(records)
+    return _run_prediction(df, target_year, target_school_year)
 
 
-# ── GET /predict/pickle — uses pre-trained models ──────────────
 @app.get("/predict/pickle", response_model=List[PredictionResult])
-def predict_from_pickle(target_year: Optional[int] = Query(None)):
+def predict_from_pickle(
+    target_year: Optional[int] = Query(None),
+    target_school_year: Optional[str] = Query(None),
+):
     """
     Uses pre-trained models from models.pkl for predictions.
     Run create_model.py first to generate the pickle file.
     """
+
     try:
         with open("models.pkl", "rb") as f:
             models = pickle.load(f)
@@ -320,19 +455,25 @@ def predict_from_pickle(target_year: Optional[int] = Query(None)):
     response.raise_for_status()
     payload = response.json()
     records = payload.get("enrollment", payload) if isinstance(payload, dict) else payload
-    df = pd.DataFrame(records)
-    df = df.rename(columns={"course": "Course", "year": "Year", "total_students": "Total_Students"})
+    df = _normalize_enrollment_dataframe(records)
 
     predictions = []
     for course, model in models.items():
         course_data = df[df["Course"] == course]
-        last_year = int(course_data["Year"].max()) if len(course_data) > 0 else 2025
-        predict_year = target_year if target_year else last_year + 1
+        last_year = int(course_data["School_Year_Value"].max()) if len(course_data) > 0 else 2025
+        predict_year = _resolve_target_school_year(
+            target_year,
+            target_school_year,
+            last_year,
+        )
         predicted_count = model.predict([[predict_year]])[0]
-        predictions.append(PredictionResult(
-            course=course,
-            predicted_year=predict_year,
-            predicted_count=max(0, int(round(predicted_count)))
-        ))
+        predictions.append(
+            PredictionResult(
+                course=course,
+                predicted_school_year=_school_year_label(predict_year),
+                predicted_year=predict_year,
+                predicted_count=max(0, int(round(predicted_count))),
+            )
+        )
 
     return predictions
