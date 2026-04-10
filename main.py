@@ -2,6 +2,7 @@ import math
 import os
 import pickle
 import re
+from datetime import date
 from typing import List, Optional
 
 import pandas as pd
@@ -32,6 +33,10 @@ INCOMPLETE_YEAR_RATIO_THRESHOLD = float(
 INCOMPLETE_YEAR_MIN_DROP = int(os.environ.get("INCOMPLETE_YEAR_MIN_DROP", "15"))
 MIN_HISTORY_FOR_INCOMPLETE_YEAR_CHECK = int(
     os.environ.get("MIN_HISTORY_FOR_INCOMPLETE_YEAR_CHECK", "4")
+)
+SCHOOL_YEAR_START_MONTH = int(os.environ.get("SCHOOL_YEAR_START_MONTH", "8"))
+PREDICTION_SCHOOL_YEAR_OFFSET = int(
+    os.environ.get("PREDICTION_SCHOOL_YEAR_OFFSET", "2")
 )
 
 
@@ -146,12 +151,39 @@ def _resolve_target_school_year(
     target_year: Optional[int],
     target_school_year: Optional[str],
     default_start_year: int,
+    today: Optional[date] = None,
 ) -> int:
     if target_school_year:
         return _parse_school_year_value(target_school_year, None)
     if target_year is not None:
         return int(target_year)
-    return default_start_year + 1
+
+    default_prediction_start = _default_prediction_school_year_start(today)
+    return max(default_start_year + 1, default_prediction_start)
+
+
+def _current_school_year_start(today: Optional[date] = None) -> int:
+    """
+    Return the active school year's start year relative to the current date.
+    With the default August start:
+    - 2026-04-10 -> 2025
+    - 2026-09-10 -> 2026
+    """
+
+    today = today or date.today()
+    if today.month >= SCHOOL_YEAR_START_MONTH:
+        return today.year
+    return today.year - 1
+
+
+def _default_prediction_school_year_start(today: Optional[date] = None) -> int:
+    """
+    Forecast ahead of the currently active school year.
+    With the default offset of 2:
+    - active 2025-2026 -> predict 2027-2028
+    """
+
+    return _current_school_year_start(today) + PREDICTION_SCHOOL_YEAR_OFFSET
 
 
 def _trim_incomplete_latest_year(
