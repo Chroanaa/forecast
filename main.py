@@ -38,6 +38,13 @@ SCHOOL_YEAR_START_MONTH = int(os.environ.get("SCHOOL_YEAR_START_MONTH", "8"))
 PREDICTION_SCHOOL_YEAR_OFFSET = int(
     os.environ.get("PREDICTION_SCHOOL_YEAR_OFFSET", "2")
 )
+SPARSE_HISTORY_BLEND_THRESHOLD = int(
+    os.environ.get("SPARSE_HISTORY_BLEND_THRESHOLD", "3")
+)
+RECENT_VALUE_WEIGHT = float(os.environ.get("RECENT_VALUE_WEIGHT", "0.65"))
+ANNUAL_MIN_RETENTION_RATIO = float(
+    os.environ.get("ANNUAL_MIN_RETENTION_RATIO", "0.9")
+)
 
 
 # Pydantic Models - Enrollment
@@ -45,12 +52,14 @@ class StudentRecord(BaseModel):
     course: str
     total_students: int
     school_year: Optional[str] = None
+    academic_year: Optional[str] = None
     year: Optional[int] = None
 
 
 class PredictionResult(BaseModel):
     course: str
     predicted_school_year: str
+    predicted_academic_year: str
     predicted_year: int
     predicted_count: int
 
@@ -61,6 +70,7 @@ class SectionHistoryRecord(BaseModel):
 
     program: str
     school_year: Optional[str] = None
+    academic_year: Optional[str] = None
     year: Optional[int] = None
     student_count: int
     section_count: int
@@ -99,6 +109,7 @@ class CapacityRequest(BaseModel):
 class SectionRoomRecommendation(BaseModel):
     program: str
     predicted_school_year: str
+    predicted_academic_year: str
     predicted_year: int
     predicted_students: int
     current_sections: int
@@ -217,18 +228,63 @@ def _trim_incomplete_latest_year(
     return ordered
 
 
+def _predict_enrollment_count(
+    training_data: pd.DataFrame,
+    *,
+    year_column: str,
+    value_column: str,
+    predict_year: int,
+) -> int:
+    X = training_data[[year_column]].values
+    y = training_data[value_column].astype(float).values
+
+    if len(X) == 0:
+        return 0
+
+    if len(X) == 1:
+        return max(0, int(round(y[-1])))
+
+    last_observed_year = int(training_data[year_column].iloc[-1])
+    last_observed_value = float(y[-1])
+    forecast_horizon_years = max(1, predict_year - last_observed_year)
+
+    model = linear_model.LinearRegression()
+    model.fit(X, y)
+    raw_prediction = float(model.predict([[predict_year]])[0])
+
+    if len(training_data) <= SPARSE_HISTORY_BLEND_THRESHOLD:
+        raw_prediction = (
+            (last_observed_value * RECENT_VALUE_WEIGHT)
+            + (raw_prediction * (1 - RECENT_VALUE_WEIGHT))
+        )
+
+    minimum_reasonable_prediction = last_observed_value * (
+        ANNUAL_MIN_RETENTION_RATIO ** forecast_horizon_years
+    )
+
+    adjusted_prediction = max(raw_prediction, minimum_reasonable_prediction)
+    return max(0, int(round(adjusted_prediction)))
+
+
 def _normalize_enrollment_dataframe(records: List[dict]) -> pd.DataFrame:
     normalized = []
 
     for record in records:
         course = _first_present(record, "Course", "course")
         total_students = _first_present(record, "Total_Students", "total_students")
-        school_year = _first_present(record, "School_Year", "school_year")
+        school_year = _first_present(
+            record,
+            "School_Year",
+            "school_year",
+            "Academic_Year",
+            "academic_year",
+        )
         year = _first_present(record, "Year", "year")
 
         if course is None or total_students is None:
             raise ValueError("Each enrollment record must include course and total_students.")
 
+        course = str(course).strip()
         school_year_value = _parse_school_year_value(school_year, year)
         normalized.append(
             {
@@ -249,13 +305,21 @@ def _normalize_section_history_dataframe(
 
     for record in section_history:
         item = record.dict() if hasattr(record, "dict") else dict(record)
-        school_year = _first_present(item, "school_year", "School_Year")
+        school_year = _first_present(
+            item,
+            "school_year",
+            "School_Year",
+            "academic_year",
+            "Academic_Year",
+        )
         year = _first_present(item, "year", "Year")
         school_year_value = _parse_school_year_value(school_year, year)
+        program = str(item["program"]).strip()
 
         normalized.append(
             {
                 **item,
+                "program": program,
                 "school_year": school_year or _school_year_label(school_year_value),
                 "school_year_value": school_year_value,
             }
@@ -282,10 +346,7 @@ def _run_prediction(
             year_column="School_Year_Value",
             value_column="Total_Students",
         )
-        X = training_data[["School_Year_Value"]].values
-        y = training_data["Total_Students"].values
-
-        if len(X) < 2:
+        if len(training_data) < 2:
             continue
 
         last_year = int(course_data["School_Year_Value"].max())
@@ -295,16 +356,19 @@ def _run_prediction(
             last_year,
         )
 
-        model = linear_model.LinearRegression()
-        model.fit(X, y)
-
-        predicted_count = model.predict([[predict_year]])[0]
+        predicted_count = _predict_enrollment_count(
+            training_data,
+            year_column="School_Year_Value",
+            value_column="Total_Students",
+            predict_year=predict_year,
+        )
         predictions.append(
             PredictionResult(
                 course=course,
                 predicted_school_year=_school_year_label(predict_year),
+                predicted_academic_year=_school_year_label(predict_year),
                 predicted_year=predict_year,
-                predicted_count=max(0, int(round(predicted_count))),
+                predicted_count=predicted_count,
             )
         )
 
@@ -358,11 +422,11 @@ def _run_capacity_prediction(
         )
 
         if len(X_years) >= 2:
-            enroll_model = linear_model.LinearRegression()
-            enroll_model.fit(X_years, y_students)
-            predicted_students = max(
-                0,
-                int(round(enroll_model.predict([[predict_year]])[0])),
+            predicted_students = _predict_enrollment_count(
+                training_data,
+                year_column="school_year_value",
+                value_column="student_count",
+                predict_year=predict_year,
             )
         else:
             predicted_students = int(y_students[-1])
@@ -439,6 +503,7 @@ def _run_capacity_prediction(
             SectionRoomRecommendation(
                 program=program,
                 predicted_school_year=_school_year_label(predict_year),
+                predicted_academic_year=_school_year_label(predict_year),
                 predicted_year=predict_year,
                 predicted_students=predicted_students,
                 current_sections=current_sections,
@@ -539,20 +604,30 @@ def predict_from_pickle(
 
     predictions = []
     for course, model in models.items():
-        course_data = df[df["Course"] == course]
+        normalized_course = str(course).strip()
+        course_data = df[df["Course"] == normalized_course]
         last_year = int(course_data["School_Year_Value"].max()) if len(course_data) > 0 else 2025
         predict_year = _resolve_target_school_year(
             target_year,
             target_school_year,
             last_year,
         )
-        predicted_count = model.predict([[predict_year]])[0]
         predictions.append(
             PredictionResult(
-                course=course,
+                course=normalized_course,
                 predicted_school_year=_school_year_label(predict_year),
+                predicted_academic_year=_school_year_label(predict_year),
                 predicted_year=predict_year,
-                predicted_count=max(0, int(round(predicted_count))),
+                predicted_count=_predict_enrollment_count(
+                    _trim_incomplete_latest_year(
+                        course_data,
+                        year_column="School_Year_Value",
+                        value_column="Total_Students",
+                    ),
+                    year_column="School_Year_Value",
+                    value_column="Total_Students",
+                    predict_year=predict_year,
+                ),
             )
         )
 

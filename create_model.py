@@ -93,13 +93,20 @@ normalized = []
 for record in records:
     course = _first_present(record, "Course", "course")
     total_students = _first_present(record, "Total_Students", "total_students")
-    school_year = _first_present(record, "School_Year", "school_year")
+    school_year = _first_present(
+        record,
+        "School_Year",
+        "school_year",
+        "Academic_Year",
+        "academic_year",
+    )
     year = _first_present(record, "Year", "year")
 
     if course is None or total_students is None:
         print(f"Skipping invalid record: {record}")
         continue
 
+    course = str(course).strip()
     school_year_value = _parse_school_year_value(school_year, year)
     normalized.append(
         {
