@@ -12,6 +12,13 @@ API_URL = os.environ.get(
     "ENROLLMENT_API_URL",
     "http://localhost:3000/api/enrollment-forecast",
 )
+INCOMPLETE_YEAR_RATIO_THRESHOLD = float(
+    os.environ.get("INCOMPLETE_YEAR_RATIO_THRESHOLD", "0.25")
+)
+INCOMPLETE_YEAR_MIN_DROP = int(os.environ.get("INCOMPLETE_YEAR_MIN_DROP", "15"))
+MIN_HISTORY_FOR_INCOMPLETE_YEAR_CHECK = int(
+    os.environ.get("MIN_HISTORY_FOR_INCOMPLETE_YEAR_CHECK", "4")
+)
 
 
 def _first_present(record: dict, *keys: str):
@@ -36,6 +43,32 @@ def _parse_school_year_value(school_year=None, year=None) -> int:
         return int(year)
 
     raise ValueError("A school_year or year value is required.")
+
+
+def _trim_incomplete_latest_year(data, *, year_column, value_column):
+    """
+    Ignore a clearly partial trailing year so the saved models reflect the
+    complete-year trend instead of a mid-year enrollment snapshot.
+    """
+
+    ordered = data.sort_values(year_column)
+    if len(ordered) < MIN_HISTORY_FOR_INCOMPLETE_YEAR_CHECK:
+        return ordered
+
+    latest_value = int(ordered[value_column].iloc[-1])
+    previous_values = ordered[value_column].iloc[:-1].astype(float)
+    baseline_value = float(previous_values.median())
+
+    if baseline_value <= 0:
+        return ordered
+
+    if (
+        latest_value <= (baseline_value * INCOMPLETE_YEAR_RATIO_THRESHOLD)
+        and (baseline_value - latest_value) >= INCOMPLETE_YEAR_MIN_DROP
+    ):
+        return ordered.iloc[:-1].copy()
+
+    return ordered
 
 
 print("Fetching enrollment data from database...")
@@ -93,8 +126,13 @@ models = {}
 
 for course in courses:
     course_data = data[data["Course"] == course]
-    X = course_data[["School_Year_Value"]].values
-    y = course_data["Total_Students"].values
+    training_data = _trim_incomplete_latest_year(
+        course_data,
+        year_column="School_Year_Value",
+        value_column="Total_Students",
+    )
+    X = training_data[["School_Year_Value"]].values
+    y = training_data["Total_Students"].values
 
     if len(X) < 2:
         print(
