@@ -36,7 +36,7 @@ MIN_HISTORY_FOR_INCOMPLETE_YEAR_CHECK = int(
 )
 SCHOOL_YEAR_START_MONTH = int(os.environ.get("SCHOOL_YEAR_START_MONTH", "8"))
 PREDICTION_SCHOOL_YEAR_OFFSET = int(
-    os.environ.get("PREDICTION_SCHOOL_YEAR_OFFSET", "2")
+    os.environ.get("PREDICTION_SCHOOL_YEAR_OFFSET", "1")
 )
 SPARSE_HISTORY_BLEND_THRESHOLD = int(
     os.environ.get("SPARSE_HISTORY_BLEND_THRESHOLD", "3")
@@ -190,8 +190,8 @@ def _current_school_year_start(today: Optional[date] = None) -> int:
 def _default_prediction_school_year_start(today: Optional[date] = None) -> int:
     """
     Forecast ahead of the currently active school year.
-    With the default offset of 2:
-    - active 2025-2026 -> predict 2027-2028
+    With the default offset of 1:
+    - active 2025-2026 -> predict 2026-2027
     """
 
     return _current_school_year_start(today) + PREDICTION_SCHOOL_YEAR_OFFSET
